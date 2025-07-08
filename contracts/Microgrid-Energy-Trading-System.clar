@@ -166,3 +166,268 @@
         (ok true)
     )
 )
+(define-map energy-escrow
+    {
+        seller: principal,
+        trade-id: uint,
+    }
+    {
+        amount: uint,
+        locked-at: uint,
+    }
+)
+
+(define-map energy-balances
+    principal
+    uint
+)
+
+(define-public (lock-energy-for-trade
+        (seller principal)
+        (trade-id uint)
+        (amount uint)
+    )
+    (let (
+            (current-balance (default-to u0 (map-get? energy-balances seller)))
+            (producer-data (unwrap! (map-get? energy-producers seller) ERR-UNAUTHORIZED))
+        )
+        (begin
+            (asserts! (>= (get energy producer-data) amount)
+                ERR-INSUFFICIENT-BALANCE
+            )
+            (map-set energy-producers seller
+                (merge producer-data { energy: (- (get energy producer-data) amount) })
+            )
+            (map-set energy-escrow {
+                seller: seller,
+                trade-id: trade-id,
+            } {
+                amount: amount,
+                locked-at: burn-block-height,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (release-escrowed-energy
+        (seller principal)
+        (buyer principal)
+        (trade-id uint)
+    )
+    (let (
+            (escrow-data (unwrap!
+                (map-get? energy-escrow {
+                    seller: seller,
+                    trade-id: trade-id,
+                })
+                ERR-TRADE-NOT-FOUND
+            ))
+            (current-buyer-balance (default-to u0 (map-get? energy-balances buyer)))
+        )
+        (begin
+            (map-set energy-balances buyer
+                (+ current-buyer-balance (get amount escrow-data))
+            )
+            (map-delete energy-escrow {
+                seller: seller,
+                trade-id: trade-id,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (return-escrowed-energy
+        (seller principal)
+        (trade-id uint)
+    )
+    (let (
+            (escrow-data (unwrap!
+                (map-get? energy-escrow {
+                    seller: seller,
+                    trade-id: trade-id,
+                })
+                ERR-TRADE-NOT-FOUND
+            ))
+            (producer-data (unwrap! (map-get? energy-producers seller) ERR-UNAUTHORIZED))
+        )
+        (begin
+            (map-set energy-producers seller
+                (merge producer-data { energy: (+ (get energy producer-data) (get amount escrow-data)) })
+            )
+            (map-delete energy-escrow {
+                seller: seller,
+                trade-id: trade-id,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-energy-balance (user principal))
+    (default-to u0 (map-get? energy-balances user))
+)
+
+(define-read-only (get-escrow-info
+        (seller principal)
+        (trade-id uint)
+    )
+    (map-get? energy-escrow {
+        seller: seller,
+        trade-id: trade-id,
+    })
+)
+(define-map price-history
+    uint
+    {
+        timestamp: uint,
+        average-price: uint,
+        total-volume: uint,
+        trade-count: uint,
+    }
+)
+
+(define-map daily-market-stats
+    uint
+    {
+        min-price: uint,
+        max-price: uint,
+        total-trades: uint,
+        total-volume: uint,
+    }
+)
+
+(define-data-var price-history-index uint u0)
+(define-data-var total-market-volume uint u0)
+(define-data-var total-market-trades uint u0)
+
+(define-public (record-trade-data
+        (price-per-unit uint)
+        (volume uint)
+    )
+    (let (
+            (current-index (var-get price-history-index))
+            (new-index (+ current-index u1))
+            (current-day (/ burn-block-height u144))
+            (current-stats (default-to {
+                min-price: price-per-unit,
+                max-price: price-per-unit,
+                total-trades: u0,
+                total-volume: u0,
+            }
+                (map-get? daily-market-stats current-day)
+            ))
+        )
+        (begin
+            (var-set price-history-index new-index)
+            (var-set total-market-volume (+ (var-get total-market-volume) volume))
+            (var-set total-market-trades (+ (var-get total-market-trades) u1))
+            (map-set price-history new-index {
+                timestamp: burn-block-height,
+                average-price: price-per-unit,
+                total-volume: volume,
+                trade-count: u1,
+            })
+            (map-set daily-market-stats current-day {
+                min-price: (if (< price-per-unit (get min-price current-stats))
+                    price-per-unit
+                    (get min-price current-stats)
+                ),
+                max-price: (if (> price-per-unit (get max-price current-stats))
+                    price-per-unit
+                    (get max-price current-stats)
+                ),
+                total-trades: (+ (get total-trades current-stats) u1),
+                total-volume: (+ (get total-volume current-stats) volume),
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (suggest-market-price (energy-amount uint))
+    (let (
+            (avg-data (get-recent-average-price))
+            (recent-trades (if (> (get count avg-data) u0)
+                (/ (get total-price avg-data) (get count avg-data))
+                u0
+            ))
+            (market-factor (if (> energy-amount u100)
+                u95
+                u105
+            ))
+        )
+        (ok (/ (* recent-trades market-factor) u100))
+    )
+)
+
+(define-read-only (get-recent-average-price)
+    (let (
+            (current-index (var-get price-history-index))
+            (lookback-start (if (> current-index u10)
+                (- current-index u10)
+                u1
+            ))
+        )
+        (fold calculate-average-helper (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) {
+            total-price: u0,
+            count: u0,
+            start-index: lookback-start,
+            current-index: current-index,
+        })
+    )
+)
+
+(define-private (calculate-average-helper
+        (offset uint)
+        (acc {
+            total-price: uint,
+            count: uint,
+            start-index: uint,
+            current-index: uint,
+        })
+    )
+    (let (
+            (index (+ (get start-index acc) offset))
+            (trade-data (map-get? price-history index))
+        )
+        (if (and (<= index (get current-index acc)) (is-some trade-data))
+            {
+                total-price: (+ (get total-price acc)
+                    (get average-price (unwrap-panic trade-data))
+                ),
+                count: (+ (get count acc) u1),
+                start-index: (get start-index acc),
+                current-index: (get current-index acc),
+            }
+            acc
+        )
+    )
+)
+
+(define-read-only (get-market-summary)
+    (let (
+            (avg-data (get-recent-average-price))
+            (current-day (/ burn-block-height u144))
+            (daily-stats (map-get? daily-market-stats current-day))
+        )
+        {
+            average-price: (if (> (get count avg-data) u0)
+                (/ (get total-price avg-data) (get count avg-data))
+                u0
+            ),
+            total-volume: (var-get total-market-volume),
+            total-trades: (var-get total-market-trades),
+            daily-stats: daily-stats,
+        }
+    )
+)
+
+(define-read-only (get-price-history-entry (index uint))
+    (map-get? price-history index)
+)
+
+(define-read-only (get-daily-stats (day uint))
+    (map-get? daily-market-stats day)
+)
