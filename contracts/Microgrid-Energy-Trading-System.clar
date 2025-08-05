@@ -431,3 +431,129 @@
 (define-read-only (get-daily-stats (day uint))
     (map-get? daily-market-stats day)
 )
+
+(define-map demand-metrics
+    uint
+    {
+        total-demand: uint,
+        fulfilled-demand: uint,
+        pending-trades: uint,
+        timestamp: uint,
+    }
+)
+
+(define-data-var demand-index uint u0)
+(define-data-var base-price uint u50)
+(define-data-var price-volatility-factor uint u10)
+
+(define-public (calculate-dynamic-price (energy-amount uint))
+    (let (
+            (total-supply (get-total-available-supply))
+            (current-demand (get-current-market-demand))
+            (supply-demand-ratio (if (> current-demand u0)
+                (/ (* total-supply u100) current-demand)
+                u100
+            ))
+            (volatility-adjustment (if (< supply-demand-ratio u80)
+                (+ (var-get price-volatility-factor) u5)
+                (if (> supply-demand-ratio u120)
+                    (- (var-get price-volatility-factor) u5)
+                    (var-get price-volatility-factor)
+                )
+            ))
+            (market-price (+ (var-get base-price) volatility-adjustment))
+            (volume-discount (if (> energy-amount u500)
+                u95
+                (if (> energy-amount u100)
+                    u98
+                    u100
+                )
+            ))
+        )
+        (ok (/ (* market-price volume-discount) u100))
+    )
+)
+
+(define-public (update-demand-metrics
+        (demand uint)
+        (fulfilled uint)
+        (pending uint)
+    )
+    (let ((new-index (+ (var-get demand-index) u1)))
+        (begin
+            (var-set demand-index new-index)
+            (map-set demand-metrics new-index {
+                total-demand: demand,
+                fulfilled-demand: fulfilled,
+                pending-trades: pending,
+                timestamp: burn-block-height,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (enable-dynamic-pricing (producer principal))
+    (let ((producer-data (unwrap! (map-get? energy-producers producer) ERR-UNAUTHORIZED)))
+        (begin
+            (asserts! (is-eq tx-sender producer) ERR-UNAUTHORIZED)
+            (let ((new-price (unwrap! (calculate-dynamic-price (get energy producer-data))
+                    ERR-INVALID-AMOUNT
+                )))
+                (ok (map-set energy-producers producer
+                    (merge producer-data { price-per-unit: new-price })
+                ))
+            )
+        )
+    )
+)
+
+(define-read-only (get-total-available-supply)
+    (fold sum-supply-helper (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0)
+)
+
+(define-read-only (get-current-market-demand)
+    (let (
+            (current-index (var-get demand-index))
+            (recent-metrics (map-get? demand-metrics current-index))
+        )
+        (if (is-some recent-metrics)
+            (get total-demand (unwrap-panic recent-metrics))
+            u0
+        )
+    )
+)
+
+(define-private (sum-supply-helper
+        (item uint)
+        (acc uint)
+    )
+    acc
+)
+
+(define-public (set-pricing-parameters
+        (new-base-price uint)
+        (new-volatility-factor uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (> new-base-price u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= new-volatility-factor u50) ERR-INVALID-AMOUNT)
+        (var-set base-price new-base-price)
+        (var-set price-volatility-factor new-volatility-factor)
+        (ok true)
+    )
+)
+
+(define-read-only (get-pricing-parameters)
+    {
+        base-price: (var-get base-price),
+        volatility-factor: (var-get price-volatility-factor),
+        current-supply: (get-total-available-supply),
+        current-demand: (get-current-market-demand),
+    }
+)
+
+(define-read-only (get-demand-metrics-entry (index uint))
+    (map-get? demand-metrics index)
+)
