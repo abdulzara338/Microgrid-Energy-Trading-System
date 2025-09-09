@@ -557,3 +557,170 @@
 (define-read-only (get-demand-metrics-entry (index uint))
     (map-get? demand-metrics index)
 )
+
+(define-map participant-reputation
+    principal
+    {
+        total-trades: uint,
+        successful-trades: uint,
+        failed-trades: uint,
+        reputation-score: uint,
+        last-updated: uint,
+    }
+)
+
+(define-map reputation-thresholds
+    (string-ascii 20)
+    uint
+)
+
+(define-constant ERR-LOW-REPUTATION (err u105))
+(define-constant MIN-REPUTATION-SCORE u60)
+
+(define-public (initialize-reputation-thresholds)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (map-set reputation-thresholds "excellent" u90)
+        (map-set reputation-thresholds "good" u70)
+        (map-set reputation-thresholds "acceptable" u50)
+        (map-set reputation-thresholds "poor" u30)
+        (ok true)
+    )
+)
+
+(define-public (update-participant-reputation
+        (participant principal)
+        (trade-successful bool)
+    )
+    (let (
+            (current-rep (default-to {
+                total-trades: u0,
+                successful-trades: u0,
+                failed-trades: u0,
+                reputation-score: u100,
+                last-updated: u0,
+            }
+                (map-get? participant-reputation participant)
+            ))
+            (new-total (+ (get total-trades current-rep) u1))
+            (new-successful (if trade-successful
+                (+ (get successful-trades current-rep) u1)
+                (get successful-trades current-rep)
+            ))
+            (new-failed (if (not trade-successful)
+                (+ (get failed-trades current-rep) u1)
+                (get failed-trades current-rep)
+            ))
+            (success-rate (if (> new-total u0)
+                (/ (* new-successful u100) new-total)
+                u100
+            ))
+        )
+        (begin
+            (map-set participant-reputation participant {
+                total-trades: new-total,
+                successful-trades: new-successful,
+                failed-trades: new-failed,
+                reputation-score: success-rate,
+                last-updated: burn-block-height,
+            })
+            (ok success-rate)
+        )
+    )
+)
+
+(define-public (create-reputation-verified-trade
+        (seller principal)
+        (amount uint)
+    )
+    (let (
+            (seller-rep (get-participant-reputation-score seller))
+            (buyer-rep (get-participant-reputation-score tx-sender))
+        )
+        (begin
+            (asserts! (>= seller-rep MIN-REPUTATION-SCORE) ERR-LOW-REPUTATION)
+            (asserts! (>= buyer-rep MIN-REPUTATION-SCORE) ERR-LOW-REPUTATION)
+            (create-trade seller amount)
+        )
+    )
+)
+
+(define-public (complete-reputation-trade
+        (trade-id uint)
+        (seller principal)
+    )
+    (begin
+        (try! (accept-trade trade-id seller))
+        (unwrap! (update-participant-reputation seller true) ERR-INVALID-AMOUNT)
+        (unwrap! (update-participant-reputation tx-sender true)
+            ERR-INVALID-AMOUNT
+        )
+        (ok true)
+    )
+)
+
+(define-public (report-failed-trade
+        (participant principal)
+        (trade-id uint)
+    )
+    (let ((trade (unwrap! (get-trade-info participant trade-id) ERR-TRADE-NOT-FOUND)))
+        (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (get buyer trade))
+                    (is-eq tx-sender participant)
+                )
+                ERR-UNAUTHORIZED
+            )
+            (unwrap! (update-participant-reputation participant false)
+                ERR-INVALID-AMOUNT
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-participant-reputation-score (participant principal))
+    (let ((rep-data (map-get? participant-reputation participant)))
+        (if (is-some rep-data)
+            (get reputation-score (unwrap-panic rep-data))
+            u100
+        )
+    )
+)
+
+(define-read-only (get-reputation-category (participant principal))
+    (let (
+            (score (get-participant-reputation-score participant))
+            (excellent-threshold (default-to u90 (map-get? reputation-thresholds "excellent")))
+            (good-threshold (default-to u70 (map-get? reputation-thresholds "good")))
+            (acceptable-threshold (default-to u50 (map-get? reputation-thresholds "acceptable")))
+        )
+        (if (>= score excellent-threshold)
+            "excellent"
+            (if (>= score good-threshold)
+                "good"
+                (if (>= score acceptable-threshold)
+                    "acceptable"
+                    "poor"
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-reputation-details (participant principal))
+    (map-get? participant-reputation participant)
+)
+
+(define-read-only (is-reliable-trader (participant principal))
+    (>= (get-participant-reputation-score participant) MIN-REPUTATION-SCORE)
+)
+
+(define-public (set-minimum-reputation-score (new-score uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (and (>= new-score u0) (<= new-score u100)) ERR-INVALID-AMOUNT)
+        (ok true)
+    )
+)
