@@ -724,3 +724,493 @@
         (ok true)
     )
 )
+
+;; =================
+;; REC TRADING SYSTEM
+;; =================
+
+;; REC Error Constants
+(define-constant ERR-REC-NOT-FOUND (err u200))
+(define-constant ERR-REC-EXPIRED (err u201))
+(define-constant ERR-INVALID-CERTIFICATION (err u202))
+(define-constant ERR-REC-ALREADY-SOLD (err u203))
+(define-constant ERR-INSUFFICIENT-REC-BALANCE (err u204))
+(define-constant ERR-INVALID-ENERGY-SOURCE (err u205))
+(define-constant ERR-LISTING-NOT-FOUND (err u206))
+(define-constant ERR-CANNOT-BUY-OWN-REC (err u207))
+
+;; REC Data Structures
+(define-map rec-registry
+    uint
+    {
+        issuer: principal,
+        energy-amount: uint,
+        certification-level: (string-ascii 20),
+        energy-source: (string-ascii 30),
+        issue-date: uint,
+        expiry-date: uint,
+        is-active: bool,
+        carbon-offset: uint,
+    }
+)
+
+(define-map rec-marketplace
+    uint
+    {
+        rec-id: uint,
+        seller: principal,
+        price-per-rec: uint,
+        quantity: uint,
+        listing-date: uint,
+        is-available: bool,
+    }
+)
+
+(define-map rec-portfolios
+    principal
+    {
+        total-recs: uint,
+        bronze-recs: uint,
+        silver-recs: uint,
+        gold-recs: uint,
+        platinum-recs: uint,
+        total-carbon-offset: uint,
+    }
+)
+
+(define-map certification-standards
+    (string-ascii 20)
+    {
+        min-efficiency: uint,
+        carbon-reduction: uint,
+        validity-period: uint,
+    }
+)
+
+;; REC State Variables
+(define-data-var rec-nonce uint u0)
+(define-data-var marketplace-nonce uint u0)
+(define-data-var default-rec-validity uint u52560)
+(define-data-var rec-base-price uint u25)
+
+;; Initialize Certification Standards
+(define-public (initialize-rec-standards)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (map-set certification-standards "bronze" {
+            min-efficiency: u60,
+            carbon-reduction: u25,
+            validity-period: u26280,
+        })
+        (map-set certification-standards "silver" {
+            min-efficiency: u75,
+            carbon-reduction: u50,
+            validity-period: u39420,
+        })
+        (map-set certification-standards "gold" {
+            min-efficiency: u85,
+            carbon-reduction: u75,
+            validity-period: u52560,
+        })
+        (map-set certification-standards "platinum" {
+            min-efficiency: u95,
+            carbon-reduction: u90,
+            validity-period: u65700,
+        })
+        (ok true)
+    )
+)
+
+;; Issue REC for Energy Production
+(define-public (issue-rec
+        (energy-amount uint)
+        (energy-source (string-ascii 30))
+        (efficiency-rating uint)
+    )
+    (let (
+            (new-rec-id (+ (var-get rec-nonce) u1))
+            (cert-level (determine-certification-level efficiency-rating))
+            (cert-standards (unwrap! (map-get? certification-standards cert-level)
+                ERR-INVALID-CERTIFICATION
+            ))
+            (carbon-offset (/ (* energy-amount (get carbon-reduction cert-standards)) u100))
+            (producer-data (unwrap! (map-get? energy-producers tx-sender) ERR-UNAUTHORIZED))
+        )
+        (begin
+            (asserts! (> energy-amount u0) ERR-INVALID-AMOUNT)
+            (asserts! (>= efficiency-rating u50) ERR-INVALID-CERTIFICATION)
+            (asserts! (validate-energy-source energy-source) ERR-INVALID-ENERGY-SOURCE)
+            (var-set rec-nonce new-rec-id)
+            (map-set rec-registry new-rec-id {
+                issuer: tx-sender,
+                energy-amount: energy-amount,
+                certification-level: cert-level,
+                energy-source: energy-source,
+                issue-date: burn-block-height,
+                expiry-date: (+ burn-block-height (get validity-period cert-standards)),
+                is-active: true,
+                carbon-offset: carbon-offset,
+            })
+            (update-portfolio-on-issue tx-sender cert-level carbon-offset)
+            (ok new-rec-id)
+        )
+    )
+)
+
+;; Create REC Marketplace Listing
+(define-public (create-rec-listing
+        (rec-id uint)
+        (price-per-rec uint)
+        (quantity uint)
+    )
+    (let (
+            (rec-data (unwrap! (map-get? rec-registry rec-id) ERR-REC-NOT-FOUND))
+            (new-listing-id (+ (var-get marketplace-nonce) u1))
+        )
+        (begin
+            (asserts! (is-eq (get issuer rec-data) tx-sender) ERR-UNAUTHORIZED)
+            (asserts! (get is-active rec-data) ERR-REC-EXPIRED)
+            (asserts! (> quantity u0) ERR-INVALID-AMOUNT)
+            (asserts! (> price-per-rec u0) ERR-INVALID-AMOUNT)
+            (asserts! (>= (get energy-amount rec-data) quantity) ERR-INSUFFICIENT-REC-BALANCE)
+            (var-set marketplace-nonce new-listing-id)
+            (map-set rec-marketplace new-listing-id {
+                rec-id: rec-id,
+                seller: tx-sender,
+                price-per-rec: price-per-rec,
+                quantity: quantity,
+                listing-date: burn-block-height,
+                is-available: true,
+            })
+            (ok new-listing-id)
+        )
+    )
+)
+
+;; Buy RECs from Marketplace
+(define-public (buy-recs
+        (listing-id uint)
+        (quantity uint)
+    )
+    (let (
+            (listing (unwrap! (map-get? rec-marketplace listing-id) ERR-LISTING-NOT-FOUND))
+            (rec-data (unwrap! (map-get? rec-registry (get rec-id listing)) ERR-REC-NOT-FOUND))
+            (total-cost (* (get price-per-rec listing) quantity))
+            (seller (get seller listing))
+        )
+        (begin
+            (asserts! (not (is-eq tx-sender seller)) ERR-CANNOT-BUY-OWN-REC)
+            (asserts! (get is-available listing) ERR-REC-ALREADY-SOLD)
+            (asserts! (get is-active rec-data) ERR-REC-EXPIRED)
+            (asserts! (>= (get quantity listing) quantity) ERR-INSUFFICIENT-REC-BALANCE)
+            (try! (stx-transfer? total-cost tx-sender seller))
+            (update-marketplace-after-purchase listing-id quantity)
+            (update-portfolio-on-purchase tx-sender (get certification-level rec-data) (get carbon-offset rec-data) quantity)
+            (ok true)
+        )
+    )
+)
+
+;; Check REC Expiration and Update Status
+(define-public (update-rec-status (rec-id uint))
+    (let ((rec-data (unwrap! (map-get? rec-registry rec-id) ERR-REC-NOT-FOUND)))
+        (begin
+            (if (>= burn-block-height (get expiry-date rec-data))
+                (begin
+                    (map-set rec-registry rec-id
+                        (merge rec-data { is-active: false })
+                    )
+                    (ok "expired")
+                )
+                (ok "active")
+            )
+        )
+    )
+)
+
+;; Transfer RECs Between Users
+(define-public (transfer-recs
+        (rec-id uint)
+        (recipient principal)
+        (quantity uint)
+    )
+    (let (
+            (rec-data (unwrap! (map-get? rec-registry rec-id) ERR-REC-NOT-FOUND))
+            (sender-portfolio (get-rec-portfolio tx-sender))
+        )
+        (begin
+            (asserts! (is-eq (get issuer rec-data) tx-sender) ERR-UNAUTHORIZED)
+            (asserts! (get is-active rec-data) ERR-REC-EXPIRED)
+            (asserts! (>= (get energy-amount rec-data) quantity) ERR-INSUFFICIENT-REC-BALANCE)
+            (update-portfolio-on-transfer tx-sender recipient (get certification-level rec-data) (get carbon-offset rec-data) quantity)
+            (ok true)
+        )
+    )
+)
+
+;; Retire RECs (remove from circulation)
+(define-public (retire-recs
+        (rec-id uint)
+        (quantity uint)
+        (retirement-reason (string-ascii 100))
+    )
+    (let ((rec-data (unwrap! (map-get? rec-registry rec-id) ERR-REC-NOT-FOUND)))
+        (begin
+            (asserts! (is-eq (get issuer rec-data) tx-sender) ERR-UNAUTHORIZED)
+            (asserts! (get is-active rec-data) ERR-REC-EXPIRED)
+            (asserts! (>= (get energy-amount rec-data) quantity) ERR-INSUFFICIENT-REC-BALANCE)
+            (map-set rec-registry rec-id
+                (merge rec-data {
+                    energy-amount: (- (get energy-amount rec-data) quantity),
+                    is-active: (> (- (get energy-amount rec-data) quantity) u0),
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Helper Functions
+(define-private (determine-certification-level (efficiency uint))
+    (if (>= efficiency u95)
+        "platinum"
+        (if (>= efficiency u85)
+            "gold"
+            (if (>= efficiency u75)
+                "silver"
+                "bronze"
+            )
+        )
+    )
+)
+
+(define-private (validate-energy-source (source (string-ascii 30)))
+    (or
+        (is-eq source "solar")
+        (or
+            (is-eq source "wind")
+            (or
+                (is-eq source "hydro")
+                (or
+                    (is-eq source "geothermal")
+                    (or
+                        (is-eq source "biomass")
+                        (is-eq source "nuclear")
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-private (update-portfolio-on-issue
+        (issuer principal)
+        (cert-level (string-ascii 20))
+        (carbon-offset uint)
+    )
+    (let (
+            (current-portfolio (default-to {
+                total-recs: u0,
+                bronze-recs: u0,
+                silver-recs: u0,
+                gold-recs: u0,
+                platinum-recs: u0,
+                total-carbon-offset: u0,
+            }
+                (map-get? rec-portfolios issuer)
+            ))
+        )
+        (map-set rec-portfolios issuer {
+            total-recs: (+ (get total-recs current-portfolio) u1),
+            bronze-recs: (if (is-eq cert-level "bronze")
+                (+ (get bronze-recs current-portfolio) u1)
+                (get bronze-recs current-portfolio)
+            ),
+            silver-recs: (if (is-eq cert-level "silver")
+                (+ (get silver-recs current-portfolio) u1)
+                (get silver-recs current-portfolio)
+            ),
+            gold-recs: (if (is-eq cert-level "gold")
+                (+ (get gold-recs current-portfolio) u1)
+                (get gold-recs current-portfolio)
+            ),
+            platinum-recs: (if (is-eq cert-level "platinum")
+                (+ (get platinum-recs current-portfolio) u1)
+                (get platinum-recs current-portfolio)
+            ),
+            total-carbon-offset: (+ (get total-carbon-offset current-portfolio) carbon-offset),
+        })
+    )
+)
+
+(define-private (update-marketplace-after-purchase
+        (listing-id uint)
+        (purchased-quantity uint)
+    )
+    (let ((listing (unwrap-panic (map-get? rec-marketplace listing-id))))
+        (if (<= purchased-quantity (get quantity listing))
+            (map-set rec-marketplace listing-id
+                (merge listing {
+                    quantity: (- (get quantity listing) purchased-quantity),
+                    is-available: (> (- (get quantity listing) purchased-quantity) u0),
+                })
+            )
+            false
+        )
+    )
+)
+
+(define-private (update-portfolio-on-purchase
+        (buyer principal)
+        (cert-level (string-ascii 20))
+        (carbon-offset uint)
+        (quantity uint)
+    )
+    (let (
+            (current-portfolio (default-to {
+                total-recs: u0,
+                bronze-recs: u0,
+                silver-recs: u0,
+                gold-recs: u0,
+                platinum-recs: u0,
+                total-carbon-offset: u0,
+            }
+                (map-get? rec-portfolios buyer)
+            ))
+        )
+        (map-set rec-portfolios buyer {
+            total-recs: (+ (get total-recs current-portfolio) quantity),
+            bronze-recs: (if (is-eq cert-level "bronze")
+                (+ (get bronze-recs current-portfolio) quantity)
+                (get bronze-recs current-portfolio)
+            ),
+            silver-recs: (if (is-eq cert-level "silver")
+                (+ (get silver-recs current-portfolio) quantity)
+                (get silver-recs current-portfolio)
+            ),
+            gold-recs: (if (is-eq cert-level "gold")
+                (+ (get gold-recs current-portfolio) quantity)
+                (get gold-recs current-portfolio)
+            ),
+            platinum-recs: (if (is-eq cert-level "platinum")
+                (+ (get platinum-recs current-portfolio) quantity)
+                (get platinum-recs current-portfolio)
+            ),
+            total-carbon-offset: (+ (get total-carbon-offset current-portfolio) (* carbon-offset quantity)),
+        })
+    )
+)
+
+(define-private (update-portfolio-on-transfer
+        (sender principal)
+        (recipient principal)
+        (cert-level (string-ascii 20))
+        (carbon-offset uint)
+        (quantity uint)
+    )
+    (begin
+        (update-portfolio-on-purchase recipient cert-level carbon-offset quantity)
+        true
+    )
+)
+
+;; REC Getter Functions
+(define-read-only (get-rec-details (rec-id uint))
+    (map-get? rec-registry rec-id)
+)
+
+(define-read-only (get-rec-listing (listing-id uint))
+    (map-get? rec-marketplace listing-id)
+)
+
+(define-read-only (get-rec-portfolio (user principal))
+    (default-to {
+        total-recs: u0,
+        bronze-recs: u0,
+        silver-recs: u0,
+        gold-recs: u0,
+        platinum-recs: u0,
+        total-carbon-offset: u0,
+    }
+        (map-get? rec-portfolios user)
+    )
+)
+
+(define-read-only (get-certification-standard (level (string-ascii 20)))
+    (map-get? certification-standards level)
+)
+
+(define-read-only (calculate-rec-value
+        (cert-level (string-ascii 20))
+        (energy-amount uint)
+    )
+    (let (
+            (cert-data (unwrap! (map-get? certification-standards cert-level)
+                (err u0)
+            ))
+            (rec-base-price-val (var-get rec-base-price))
+            (efficiency-multiplier (if (is-eq cert-level "platinum")
+                u150
+                (if (is-eq cert-level "gold")
+                    u125
+                    (if (is-eq cert-level "silver")
+                        u110
+                        u100
+                    )
+                )
+            ))
+        )
+        (ok (/ (* rec-base-price-val energy-amount efficiency-multiplier) u100))
+    )
+)
+
+(define-read-only (get-active-rec-listings)
+    (let ((current-nonce (var-get marketplace-nonce)))
+        {
+            total-listings: current-nonce,
+            marketplace-nonce: current-nonce,
+        }
+    )
+)
+
+(define-read-only (is-rec-valid (rec-id uint))
+    (let ((rec-data (map-get? rec-registry rec-id)))
+        (if (is-some rec-data)
+            (let ((rec (unwrap-panic rec-data)))
+                (and
+                    (get is-active rec)
+                    (< burn-block-height (get expiry-date rec))
+                )
+            )
+            false
+        )
+    )
+)
+
+(define-read-only (get-rec-market-summary)
+    {
+        total-recs-issued: (var-get rec-nonce),
+        total-marketplace-listings: (var-get marketplace-nonce),
+        base-rec-price: (var-get rec-base-price),
+        default-validity-period: (var-get default-rec-validity),
+    }
+)
+
+;; Admin Functions for REC System
+(define-public (set-rec-base-price (new-price uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (> new-price u0) ERR-INVALID-AMOUNT)
+        (var-set rec-base-price new-price)
+        (ok true)
+    )
+)
+
+(define-public (set-default-rec-validity (new-validity uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (> new-validity u0) ERR-INVALID-AMOUNT)
+        (var-set default-rec-validity new-validity)
+        (ok true)
+    )
+)
